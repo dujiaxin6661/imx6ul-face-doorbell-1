@@ -1,0 +1,458 @@
+========== i.MX6UL 嵌入式人脸识别门禁 — 开发过程中遇到的问题和解决方案 ==========
+
+【项目背景】
+在 i.MX6UL (Cortex-A7, 单核, 无 NPU) 开发板上部署人脸识别门禁系统。
+最初方案设计目标是 RK3566 + NPU，后因硬件变更调整技术路线。
+推理引擎: ncnn，人脸检测: UltraFace，人脸识别: MobileFaceNet。
+摄像头: V4L2 YUYV，显示屏: Framebuffer，触摸屏: GT911，门控: sysfs GPIO。
+
+
+--- 问题 1：Ubuntu 24.04 系统 pip install 失败 ---
+
+现象：
+  在 Ubuntu 虚拟机中执行 `pip install -r requirements.txt` 时报错:
+  "externally-managed-environment"
+
+原因：
+  Ubuntu 24.04 默认 Python 3.12 启用了 PEP 668，禁止直接向系统 Python 执行 pip install，
+  强制要求使用虚拟环境隔离。
+
+解决方案：
+  使用 Python 自带的 venv 创建虚拟环境:
+    python3 -m venv ~/rknn-env
+    source ~/rknn-env/bin/activate
+  或使用 Miniconda 创建独立环境:
+    conda create -n rknn python=3.10 -y
+    conda activate rknn
+  之后所有 pip install 在虚拟环境中正常执行。
+
+
+--- 问题 2：PyTorch 2.12 无法导出 TorchScript 模型为 ONNX ---
+
+现象：
+  使用 `torch.onnx.export()` 导出 MobileFaceNet 的 TorchScript 模型时报错:
+  "Exporting a ScriptModule is not supported"
+
+原因：
+  PyTorch 2.6+ 改变了 torch.onnx.export 的实现，底层使用 torch.export (Dynamo)，
+  而 TorchScript 模型与新的导出路径不兼容。
+
+解决方案：
+  创建一个临时 conda 环境安装旧版 PyTorch 2.2.0，原生支持 TorchScript → ONNX:
+    conda create -n temp-export python=3.10 -y
+    conda activate temp-export
+    pip install torch==2.2.0 onnx
+    python export_mfn.py
+  导出成功后将 ONNX 文件拷贝到主项目目录。
+
+
+--- 问题 3：PyTorch 2.12 的 torch.load 默认行为变化 ---
+
+现象：
+  在 rknn-yolov5 仓库中执行 `python export.py` 时报错:
+  "Weights only load failed. This file can still be loaded..."
+
+原因：
+  PyTorch 2.6 将 torch.load 的 weights_only 默认值从 False 改为 True。
+  而旧版 YOLOv5 导出脚本没有传 weights_only=False，导致加载失败。
+
+解决方案：
+  pip install torch==2.4.0 降级 PyTorch 版本。
+  注意: torch 2.4 与 torchvision 2.12 存在版本不兼容的 Warning，
+  但 ONNX 导出不需要 torchvision，不影响最终结果。
+
+
+--- 问题 4：硬件平台变更 — RK3566 → i.MX6UL ---
+
+现象：
+  开发过程中发现目标芯片不是 RK3566 (带 NPU)，而是 i.MX6UL (Cortex-A7, 无 NPU)。
+  之前准备的 RKNN 模型 (.rknn)、RKNN C API (rknn_api.h)、librknnrt.so 全部作废。
+
+原因：
+  原始需求文档的硬件描述有误。
+
+解决方案：
+  全面调整技术方案:
+  1) 推理引擎: RKNN → ncnn (腾讯开源, 专为 ARM NEON 优化)
+  2) 人脸检测: YOLOv5s (NPU) → UltraFace Slim (ncnn CPU推理, ~300KB)
+  3) 人脸识别: MobileFaceNet (NPU) → MobileFaceNet (ncnn CPU推理, ~4MB)
+  4) GPIO: libgpiod → sysfs GPIO (文件I/O, 零外部依赖)
+  5) 去掉所有 OpenCV/librknnrt/librknnrt 外部库依赖
+  6) 代码从纯 C 改为 C + C++ 混合编译 (ncnn 是 C++ API)
+  7) 使用 extern "C" 包装 C++ 函数，让主程序 (C) 能调用 AI 模块
+
+
+--- 问题 5：Buildroot 工具链缺少 libgpiod 和 OpenCV ---
+
+现象：
+  find 工具链目录找不到 gpiod.h 和 opencv/cv.h。Buildroot 虽然配了 opencv3.mk
+  包，但尚未编译。
+
+原因：
+  Buildroot 默认不勾选 libgpiod / OpenCV 包，因此工具链 sysroot 中没有这些头文件
+  和库。要为单核低性能的 i.MX6UL 交叉编译完整 OpenCV 不仅耗时长，且最终二进制体积过大。
+
+解决方案：
+  彻底去掉这两个外部依赖:
+  1) GPIO 控制改用 sysfs 文件系统接口:
+       写 /sys/class/gpio/export 导出引脚
+       写 /sys/class/gpio/gpioN/direction 设置方向
+       写 /sys/class/gpio/gpioN/value 控制高低电平
+     这是 Linux 内核原生 GPIO 接口，无需任何库，仅需文件 I/O。
+  2) 人脸检测不再依赖 OpenCV Haar Cascade，改用 ncnn 推理 UltraFace 神经网络。
+
+
+--- 问题 6：ncnn 交叉编译环境搭建 + onnx2ncnn 工具编译 ---
+
+现象：
+  cmake 执行后报 "Could NOT find protobuf"，tools/onnx/onnx2ncnn 目标无法生成。
+  make -j4 完成后 tools/onnx/ 目录不存在。
+
+原因：
+  Ubuntu apt 安装的 libprotobuf-dev 是传统 pkg-config 模式 (.pc 文件)，
+  但 ncnn 的 CMakeLists.txt 使用的是 find_package(protobuf CONFIG)，
+  要求 protobuf 提供 cmake config 文件 (.cmake)。两者不兼容。
+
+解决方案：
+  绕过 cmake，手动编译 onnx2ncnn 工具:
+    # 步骤1: 用 protoc 生成 C++ 代码
+    cd ~/ncnn/tools/onnx
+    protoc --cpp_out=. onnx.proto
+
+    # 步骤2: 手动 g++ 编译链接
+    mkdir -p ~/ncnn/build-pc/tools/onnx
+    g++ -std=c++11 -I/usr/include -I. \
+        onnx2ncnn.cpp onnx.pb.cc \
+        -L/usr/lib/x86_64-linux-gnu -lprotobuf \
+        -o ~/ncnn/build-pc/tools/onnx/onnx2ncnn
+
+  cmake 的 protobuf 查找问题属于构建系统兼容性 bug，通过在命令行指定
+  Protobuf_INCLUDE_DIR / Protobuf_LIBRARY / Protobuf_PROTOC_EXECUTABLE
+  变量也可以绕过 CONFIG 模式的检测。
+
+
+--- 问题 7：ncnn 的 from_pixels_resize API 不兼容 ---
+
+现象：
+  编写 face_detect.cpp 时使用了 ncnn::Mat::from_pixels_resize()，该函数
+  在不同 ncnn 版本中可能不存在或签名不同。
+
+原因：
+  ncnn 的 API 在不同版本间有变化，from_pixels_resize 并非所有版本的稳定接口。
+
+解决方案：
+  自己实现双线性插值 resize，然后调用稳定的 from_pixels API:
+    static void rgb_resize_bilinear(src, sw, sh, dst, dw, dh)
+    ncnn::Mat in = ncnn::Mat::from_pixels(resized, ncnn::Mat::PIXEL_RGB, dw, dh);
+  手动实现的 resize 不依赖 ncnn 版本，可移植性更好。
+
+
+--- 问题 8：C/C++ 混合编译和 extern "C" 链接 ---
+
+现象：
+  项目主体是 C (main.c, v4l2_capture.c, feature_db.c 等)，但 ncnn 推理
+  模块必须用 C++ 写。C 调用 C++ 函数时出现 undefined reference 链接错误。
+
+原因：
+  C++ 编译器会对函数名做 name mangling (用于支持重载)，而 C 编译器不会。
+  链接时两个模块的符号表格式不同，导致找不到对方。
+
+解决方案：
+  在头文件中使用 extern "C" 包裹函数声明:
+    #ifdef __cplusplus
+    extern "C" {
+    #endif
+    int face_detect_init(void);
+    ...
+    #ifdef __cplusplus
+    }
+    #endif
+  Makefile 中 .c 用 gcc 编译，.cpp 用 g++ 编译，链接时用 g++ (自动链接 -lstdc++)。
+
+
+--- 问题 9：ncnn 交叉编译工具链编译器名称不匹配 ---
+
+现象：
+  执行 cmake 交叉编译 ncnn 时，报找不到编译器 arm-linux-gnueabihf-gcc。
+
+原因：
+  ncnn 自带的 arm-linux-gnueabihf.toolchain.cmake 里写的编译器名是
+  "arm-linux-gnueabihf-gcc/g++"（通用名），但 100ask i.MX6UL SDK 的实际
+  Buildroot 编译器叫 "arm-buildroot-linux-gnueabihf-gcc/g++"。
+
+解决方案：
+  修改 ncnn 工具链文件中的编译器名称:
+    cd ~/ncnn
+    sed -i 's/arm-linux-gnueabihf-gcc/arm-buildroot-linux-gnueabihf-gcc/g' \
+        toolchains/arm-linux-gnueabihf.toolchain.cmake
+    sed -i 's/arm-linux-gnueabihf-g++/arm-buildroot-linux-gnueabihf-g++/g' \
+        toolchains/arm-linux-gnueabihf.toolchain.cmake
+  关键是理解编译器的命名取决于 SDK/Buildroot 的配置，不同厂商可能不同，
+  需要用 which xxx-gcc 确认实际名称后再改工具链文件。
+
+
+--- 问题 10：ncnn include 路径双嵌套问题 ---
+
+现象：
+  Makefile 设置了 NCNN_INC = .../ncnn-arm/include/ncnn，编译 face_detect.cpp
+  时找不到 <ncnn/net.h>。
+
+原因：
+  ncnn 安装后头文件在 .../include/ncnn/net.h，代码里写 #include <ncnn/net.h>。
+  Makefile 的 -I 应指向 include/，这样编译器在 include/ncnn/net.h 搜索路径。
+  之前多加了一级 /ncnn，变成了 include/ncnn/ncnn/net.h，自然找不到。
+
+解决方案：
+  NCNN_INC = /home/jason/ncnn-arm/include
+  不是 /home/jason/ncnn-arm/include/ncnn
+  规则: -I 路径 + #include 中的相对路径 = 完整文件路径。
+
+
+--- 问题 11：OpenMP 单核链接错误 ---
+
+现象：
+  ncnn 交叉编译成功，但链接项目时大量 undefined reference to `omp_get_num_threads',
+  `omp_get_thread_num' 等 OpenMP 符号。错误分布在 libncnn.a 众多 .cpp.o 文件中。
+
+原因：
+  ncnn cmake 默认 -DNCNN_OPENMP=ON，编译时启用了多线程并行支持。但 i.MX6UL
+  是单核 Cortex-A7，不需要多线程并行；且 Buildroot 工具链不包含 libgomp 运行时库。
+
+解决方案：
+  重新编译 ncnn 时显式关闭 OpenMP:
+    cmake ... -DNCNN_OPENMP=OFF ...
+  单核芯片上多线程反而增加上下文切换开销，关闭后编译链路更简洁。
+
+
+--- 问题 12：v4l2_capture.c 缺少 MOCK_MODE 保护 ---
+
+现象：
+  make MOCK=1 编译成功，但在板子上运行时仍然报 "set format failed" 并退出。
+  其他模块 (face_detect, face_recog, gpio_control) 的 mock 都正常。
+
+原因：
+  整个项目中 v4l2_capture.c 是唯一没有 #if MOCK_MODE 条件编译的硬件模块。
+  其 camera_init() 直接执行 open("/dev/video0") 并尝试设置 YUYV/MJPEG 格式。
+  /dev/video0 在 i.MX6UL 上是 pxp (像素处理管线)，不是真正的摄像头，无法支持
+  V4L2_CAP_VIDEO_CAPTURE 格式设置。
+
+解决方案：
+  给 v4l2_capture.c 添加完整的 MOCK_MODE 分支:
+    #if MOCK_MODE
+      camera_init(): 设置 cam_width/height，生成静态测试图案 (假 YUYV)
+      camera_release(): 空实现
+      camera_get_frame(): 返回预生成的条纹测试画面，供显示模块渲染
+    #else
+      原来的真实 V4L2 代码
+    #endif
+  这样 mock 模式下整个项目链路 (采集→显示→识别→门控) 全部可跑通。
+
+
+--- 问题 13：i.MX6UL 的 PXP 与 USB UVC 摄像头区分 ---
+
+现象：
+  板子上 ls /dev/video0 存在，但摄像头初始化总失败，无法确定是驱动问题还是
+  硬件问题。
+
+原因：
+  i.MX6UL SoC 内部集成了 PXP (Pixel Pipeline) 模块，上电即注册 /dev/video0。
+  但它不是摄像头，而是图像处理加速器，不支持 V4L2_CAP_VIDEO_CAPTURE 的 YUYV/MJPEG
+  格式。真正的 USB 摄像头需要插上后出现 /dev/video1 (或更高编号)，且驱动为 uvcvideo。
+
+诊断方法：
+  lsusb                          # 查 USB 设备: 有 UVC 摄像头吗
+  dmesg | grep -i uvc            # 查 UVC 驱动是否加载
+  cat /sys/class/video4linux/video*/name  # 查每个 video 设备的名字
+  v4l2-ctl --list-devices        # 查完整 V4L2 设备列表
+
+解决方案：
+  插上 USB 摄像头后确认 /dev/video1 出现，修改 config.h:
+    #define CAM_DEVICE "/dev/video1"
+  注意不是 /dev/video0。
+
+
+--- 问题 14：mock 模式与真实硬件模式的切换 ---
+
+现象：
+  开发阶段无法每时每刻都有硬件板子可用，需要在 PC 上测试代码逻辑，
+  但 camera_init、face_detect_init 等函数依赖硬件设备。
+
+解决方案：
+  通过 config.h 和 Makefile 实现条件编译:
+    #ifndef MOCK_MODE
+    #define MOCK_MODE 0
+    #endif
+  命令行: make MOCK=1  → 所有硬件相关代码替换为空实现/假数据
+  命令行: make          → 完整硬件 + ncnn 推理
+  这种机制让 PC 端逻辑测试和板端部署共用一套源码。
+
+
+--- 问题 15：UltraFace 人脸检测模型不画框 (模型输出与解码层不匹配) ---
+
+现象：
+  程序在板端运行时，摄像头画面正常显示，但屏幕上没有绿色人脸检测框。
+  日志显示 face_detect_run 返回 num_boxes=0 或返回的框极小 (10~16 像素)，
+  max_conf 只有 0.063 左右。
+
+诊断过程：
+  Step 1: 在 main.c 的检测→保存→UI 三个环节加 printf，确认检测到但框坐标异常。
+  Step 2: 在 face_detect.cpp 打印 scores 和 boxes 输出维度，发现 scores.h=4420
+           但锚点只生成了 3200 个。
+  Step 3: 打印 boxes_out 数据，确认数据存在但解码出的框退化为锚点本身的大小。
+
+原因：
+  ① 锚点数量不匹配: 下载的 UltraFace 模型是 Linzaer 的 RFB-320 版本，
+     锚点方案为 stride 8/16/32/64 分别配 3/2/2/3 个尺寸 = 4420 个锚点。
+     而代码中 generate_anchors 使用的是旧版 Slim 320 的方案
+     (每 stride 2 个尺寸 = 3200 个锚点)。模型输出的 4420 组预测与 3200 个
+     锚点错位，后处理循环存在越界风险，且正确解码的 box 也无法匹配到锚点。
+  ② 置信度阈值过高: 默认阈值为 0.5，但模型实际输出 max_conf 仅约 0.063。
+     需要降低到 0.03 才能有检出。
+  ③ ncnn Mat 数据访问方式: ncnn::Mat 的 operator[] 在不同版本中行为不一致，
+     部分版本无法正确访问 (w,h,c) 层次的数据。需显式转换为 (float*)data 指针。
+
+解决方案：
+  1) 重写 generate_anchors 匹配 RFB-320 配置:
+       {8.0f,  3, {10, 16, 24}}
+       {16.0f, 2, {32, 48}}
+       {32.0f, 2, {64, 96}}
+       {64.0f, 3, {128, 192, 256}}
+     总计 30×40×3 + 15×20×2 + 8×10×2 + 4×5×3 = 4420 锚点。
+  2) 置信度阈值从 0.5 降低到 0.03 (实际模型输出偏低)。
+  3) scores/boxes_out 的数据读取改用 (const float*)mat.data 显式指针访问。
+  4) 加粗人脸框线宽 (2px→4px)，在 1024 屏上更可见。
+  关键教训: 模型 ONNX 来源决定锚点方案，不同模型的锚点参数不可混用。
+  下载模型后第一步应确认特征图尺寸和锚点总数。
+
+
+--- 问题 16：ncnn::Net API 版本兼容性问题 ---
+
+现象：
+  编译 face_detect.cpp 时，调用 net->blob_count()、net->blob_name(i)、
+  net->input_count()、net->output_count()、net->output_name(i) 均报
+  "no member named" 错误。
+
+原因：
+  不同版本的 ncnn (GitHub master 分支) API 有差异。旧版 API (blob_count/blob_name)
+  已删除，新版使用 input_names()/output_names() 返回 std::vector。
+  ncnn::Mat 也没有统一的 from_pixels_resize 方法。
+
+解决方案：
+  - 查询输出层名: net->input_names() / net->output_names() (返回 vector)
+  - 图像预处理: 自己实现双线性插值 resize，再用 from_pixels() 创建 Mat
+  - 数据访问: 用 (float*)mat.data 指针遍历，避免 operator[] 版本差异
+  教训: 开源推理框架在活跃开发期 API 变化频繁，开发时应固定版本号并查阅对应文档。
+
+
+========== 技术要点总结 ==========
+
+1. 嵌入式 AI 部署的关键挑战: 如何在没有 NPU 的低性能芯片上运行神经网络。
+   答案: ncnn (ARM NEON 优化) + 轻量模型 (UltraFace ~300KB, MobileFaceNet ~4MB)。
+
+2. 依赖管理: 优先使用 Linux 内核原生接口 (V4L2, sysfs GPIO, framebuffer, input)，
+   尽量减少外部库依赖，降低交叉编译复杂度。
+
+3. 构建系统: 当 cmake 包查找机制与系统安装方式不匹配时，
+   可以直接使用底层工具 (protoc + g++) 手动完成编译。理解构建工具的底层原理很重要。
+
+4. 模型转换链路: PyTorch → ONNX → ncnn (.param + .bin)。
+   每一步都可能因版本变化产生兼容性问题，需要灵活调整。
+
+5. 编译工具链适配: 不同 SDK 厂商的交叉编译器命名可能不同 (arm-linux-gnueabihf vs
+   arm-buildroot-linux-gnueabihf)。理解 cmake toolchain 文件的作用并会修改是关键。
+
+6. 单核芯片特殊处理: 关闭不必要的多线程功能 (OpenMP)，避免引入缺失的运行时依赖。
+
+7. Mock 机制是嵌入式开发的最佳实践: 在没有硬件时先调通软件逻辑，逐模块排查，
+   可以大幅提高开发效率。每个硬件模块都应有 mock 分支。
+
+8. 外设诊断: /dev 下的设备节点 ≠ 真实外设。i.MX6UL 的 PXP 注册了 /dev/video0
+   但不可用于摄像头采集。需要用 lsusb + dmesg + 设备名综合判断。
+
+9. 模型部署的锚点匹配: 不同模型 ONNX 来源决定锚点配置 (数量+尺寸+stride)。
+   下载模型后第一步应确认输出维度，确保解码层与模型输出严格对齐。
+
+10. 开源推理引擎 API 稳定性: ncnn 等活跃框架的 API 可能随版本剧烈变动。
+    开发时应锁定版本号，查阅对应版本的头文件确认接口签名。
+   关键方法: 查 .h 文件看成员函数列表，比搜索博客/文档更可靠。
+
+11. 终端推理调试方法论: 模型推理结果异常时，应分层排查:
+    预处理 → 输入维度 → 输出维度 → 输出数据范围 → 解码逻辑。
+    printf 逐层打印是嵌入式平台最有效的调试手段之一。
+
+
+========== 版本升级记录：从多人特征库切换为 1:1 人脸验证 ==========
+
+【变更动机】
+  原方案: 多人本地特征库 (user_features.bin, 注册/删除/查询)，依赖屏幕按钮交互
+  新方案: 1:1 验证，启动时加载一张参考照片的特征，每帧只与参考对比
+  原因: 项目的核心目标是"AI 与嵌入式的结合"，复杂 UI 不是重点。
+  1:1 验证模式更聚焦于 ncnn 推理 + 特征提取 + 欧氏距离比对的技术演示。
+
+
+--- 变更 1：新增 PC 端工具 gen_reference.py ---
+
+  位置: tools/gen_reference.py
+  作用: 在 PC 上用 ONNX Runtime 从标准照提取 128 维特征，保存为 reference.bin (512 字节)
+  流程: 照片 → OpenCV Haar 检测人脸 → 裁剪 112x112 → MobileFaceNet ONNX 推理 → L2归一化 → 保存
+  依赖: pip install onnxruntime pillow opencv-python
+  为什么不用 gen_reference.c: 需要交叉编译 ncnn PC 版本才能跑 C 版工具，Python 版更轻量
+
+
+--- 变更 2：简化 config.h ---
+
+  删除: FEATURE_DB_PATH, MAX_USERS, MAX_VECTORS_PER_USER, REGISTER_FRAMES, CASCADE_PATH
+  新增: REFERENCE_BIN (reference.bin 路径)
+  保留: 摄像头、屏幕、触摸屏、GPIO、模型路径、FACE_FEAT_DIM=128
+
+
+--- 变更 3：简化 main.c ---
+
+  删除: feature_db.h 引用、注册模式 (register_mode/collect_register_embedding)、
+        按钮回调 (on_button)、多人管理逻辑
+  新增: load_reference() 函数，启动时读取 reference.bin 到 ref_embedding[128]
+  识别线程变更:
+    原: 检测 → 提取特征 → 特征库比对 (遍历所有用户) → 开门
+    新: 检测 → 提取特征 → 与 ref_embedding 单次欧氏距离比对 → 开门
+  节流: 3 秒内不重复开门 (last_open_time 控制)
+  共享变量: last_boxes/last_num_boxes (检测框)、last_match/last_distance/last_name (识别结果)
+
+
+--- 变更 4：简化 display.h / display.c ---
+
+  删除: display_set_btn_callback、display_check_btn_hit、feature_db_count、
+        触摸按钮区域绘制 ([ Register ] / [ Delete User ] / [ View Log ])
+  新增: display_update_screen 参数 (match, result_name, distance)
+  右侧面板: 仅显示 Result/Dist/Status + 系统信息，无交互
+  人脸框: 匹配成功 = 绿色, 陌生人 = 蓝色
+  颜色坑: rgb_to_fb 函数从 BGR 格式改为 ARGB 格式，匹配参考代码的实际硬件
+        BGR: (b << 16) | (g << 8) | r
+        ARGB: (0xFF << 24) | (r << 16) | (g << 8) | b
+
+
+--- 变更 5：阈值调整为可配置 ---
+
+  FACE_RECOG_THRESH 默认 1.0，但实际同一个人因光照/角度差异可能达到 1.3~1.5。
+  阈值越大越宽松 (容易通过)，越小越严格 (容易拒绝)。
+  建议根据实测在 config.h 中调整，如 1.5f 或 1.8f。
+
+
+--- 变更 6：清理废弃文件 ---
+
+  删除: src/feature_db.c, src/feature_db.h (多人特征库)
+  删除: tools/gen_reference.c, tools/Makefile (被 Python 版本替代)
+  删除: scripts/convert_yolov5s.py, convert_mobilefacenet.py, check*.onnx (RKNN 旧方案)
+
+
+========== 架构总结 (最终版) ==========
+
+  硬件: i.MX6UL (Cortex-A7, 无 NPU, ARM NEON)
+  推理引擎: ncnn (arm-buildroot-linux-gnueabihf-gcc/g++ 交叉编译)
+  人脸检测: UltraFace Slim (ncnn, 320x240, 4420 anchors)
+  人脸识别: MobileFaceNet (ncnn, 112x112, 128维特征)
+  验证模式: 1:1 欧氏距离比对 (reference.bin 来自 PC 端 Python 工具)
+  显示: 直接帧缓冲 (ARGB8888), 无 LVGL, 无触摸交互
+  GPIO: sysfs 文件 I/O (/sys/class/gpio/gpio17/)
+  采集: V4L2 mmap (YUYV 640x480)
+  编译: make (交叉编译) / make MOCK=1 (PC 逻辑测试)
+  部署: adb push + adb shell

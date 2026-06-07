@@ -1,0 +1,25 @@
+# Claude Code 内部文件
+.claude/
+
+# ncnn ARM 交叉编译产物 (应在目标机上重新编译)
+1/
+
+# 编译产物
+*.o
+*.out
+face_doorbell
+
+# 参考备份
+reference/
+
+# ONNX 中间模型文件 (太大, PC 端自行导出)
+models/*.onnx
+
+# 废弃的 RKNN 文件
+models/*.rknn
+
+# 临时文件
+*.swp
+*.swo
+*~
+.DS_Store
